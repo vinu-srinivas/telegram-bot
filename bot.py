@@ -32,12 +32,14 @@ PORT = int(os.environ.get("PORT", 10000))
 # Free OpenRouter models — bot rotates through these on rate limit
 # Ordered by quality/reliability for tool calling
 FREE_MODELS = [
-    "meta-llama/llama-3.3-70b-instruct:free",         # ⭐ Best quality + tools
-    "google/gemini-2.0-flash-exp:free",               # Fast + tools
-    "mistralai/mistral-small-3.2-24b-instruct:free",  # Good tools
-    "qwen/qwen3-32b:free",                            # Solid backup
-    "deepseek/deepseek-chat-v3-0324:free",            # Strong reasoning
-    "meta-llama/llama-3.2-11b-vision-instruct:free",  # Last resort
+    "meta-llama/llama-3.3-70b-instruct:free",              # ⭐ Best + tools
+    "deepseek/deepseek-chat-v3.1:free",                     # Strong reasoning + tools
+    "qwen/qwen3-235b-a22b:free",                            # Large + tools
+    "mistralai/mistral-small-3.2-24b-instruct:free",        # Fast + tools
+    "meta-llama/llama-3.1-405b-instruct:free",              # Huge model
+    "nvidia/llama-3.1-nemotron-70b-instruct:free",          # Solid backup
+    "google/gemma-3-27b-it:free",                           # Google model
+    "qwen/qwen3-coder:free",                                # Coding specialist
 ]
 
 # Allow override via env var
