@@ -1,59 +1,23 @@
-import os
-import json
-import time
-import uuid
-import datetime
-import traceback
-import re
-import io
-import ssl
-import gzip
-import urllib.request
-import urllib.parse
-import contextlib
-from threading import Thread, Lock
+import os, json, time, uuid, datetime, traceback, re, io, ssl, gzip
+import urllib.request, urllib.parse, contextlib
+from threading import Thread
 
 import requests
 from flask import Flask, send_file, jsonify
 from openai import OpenAI
 
-# ─── Config ──────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    raise SystemExit("Set GROQ_API_KEY — get free at https://console.groq.com/keys")
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-if not OPENROUTER_API_KEY:
-    raise SystemExit("Set OPENROUTER_API_KEY — get free at https://openrouter.ai/keys")
-
+MODEL_NAME = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://localhost:10000")
 LOG_FILE = os.environ.get("LOG_FILE", "run.jsonl")
 LOG_URL = f"{PUBLIC_BASE_URL.rstrip('/')}/run.jsonl"
 PORT = int(os.environ.get("PORT", 10000))
 
-# Free OpenRouter models — bot rotates through these on rate limit
-# Ordered by quality/reliability for tool calling
-FREE_MODELS = [
-    "meta-llama/llama-3.3-70b-instruct:free",              # ⭐ Best + tools
-    "deepseek/deepseek-chat-v3.1:free",                     # Strong reasoning + tools
-    "qwen/qwen3-235b-a22b:free",                            # Large + tools
-    "mistralai/mistral-small-3.2-24b-instruct:free",        # Fast + tools
-    "google/gemma-3-27b-it:free",                           # Google model
-    "qwen/qwen3-coder:free",                                # Coding specialist
-]
-
-# Allow override via env var
-CUSTOM_MODEL = os.environ.get("LLM_MODEL")
-if CUSTOM_MODEL:
-    FREE_MODELS = [CUSTOM_MODEL] + [m for m in FREE_MODELS if m != CUSTOM_MODEL]
-
-client = OpenAI(
-    api_key=OPENROUTER_API_KEY,
-    base_url="https://openrouter.ai/api/v1",
-    default_headers={
-        "HTTP-Referer": PUBLIC_BASE_URL,
-        "X-Title": "TDS Data Analyst Bot",
-    },
-)
-
+client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 BROWSER_HEADERS = {
@@ -67,41 +31,10 @@ BROWSER_HEADERS = {
 _url_cache = {}
 _URL_CACHE_MAX = 30
 
-# ─── Model rotation ──────────────────────────────────────────────
-_model_lock = Lock()
-_current_model_idx = 0
-_model_cooldowns = {}
-
-print(f"[boot] Loaded {len(FREE_MODELS)} free OpenRouter models:")
-for i, m in enumerate(FREE_MODELS):
-    print(f"[boot]   #{i+1}: {m}")
+print(f"[boot] Bot starting. MODEL={MODEL_NAME}  Provider=Groq")
 
 
-def _pick_model() -> tuple[int, str]:
-    global _current_model_idx
-    now = time.time()
-    with _model_lock:
-        for offset in range(len(FREE_MODELS)):
-            idx = (_current_model_idx + offset) % len(FREE_MODELS)
-            if _model_cooldowns.get(idx, 0) <= now:
-                _current_model_idx = idx
-                return idx, FREE_MODELS[idx]
-        if _model_cooldowns:
-            min_idx = min(_model_cooldowns, key=lambda k: _model_cooldowns[k])
-            _current_model_idx = min_idx
-            return min_idx, FREE_MODELS[min_idx]
-        return 0, FREE_MODELS[0]
-
-
-def _mark_model_ratelimited(idx: int, cd: int = 60):
-    global _current_model_idx
-    with _model_lock:
-        _model_cooldowns[idx] = time.time() + cd
-        _current_model_idx = (idx + 1) % len(FREE_MODELS)
-        print(f"[model] #{idx+1} ({FREE_MODELS[idx]}) LIMITED {cd}s → next #{_current_model_idx+1}")
-
-
-def log_run(entry: dict):
+def log_run(entry):
     entry["timestamp"] = datetime.datetime.utcnow().isoformat() + "Z"
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -110,8 +43,7 @@ def log_run(entry: dict):
         print("log write failed:", e)
 
 
-# ─── HTML noise stripper ────────────────────────────────────────
-def _strip_html_noise(html: str) -> str:
+def _strip_html_noise(html):
     html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.I)
     html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.I)
     html = re.sub(r'<nav[^>]*>.*?</nav>', '', html, flags=re.DOTALL | re.I)
@@ -129,8 +61,7 @@ def _strip_html_noise(html: str) -> str:
     return html
 
 
-# ─── Tools ───────────────────────────────────────────────────────
-def fetch_url(url: str, max_bytes: int = 500_000) -> str:
+def fetch_url(url, max_bytes=500_000):
     if not url or not url.startswith(("http://", "https://")):
         return "[fetch_url ERROR] Invalid URL. Try Wikipedia."
     if url in _url_cache:
@@ -164,7 +95,7 @@ def fetch_url(url: str, max_bytes: int = 500_000) -> str:
         return f"[fetch_url ERROR] {e}"
 
 
-def web_search(query: str, max_results: int = 6) -> str:
+def web_search(query, max_results=6):
     if not query.strip():
         return "[web_search ERROR] empty query"
     try:
@@ -193,7 +124,7 @@ def web_search(query: str, max_results: int = 6) -> str:
         return f"[web_search ERROR] {e}"
 
 
-def run_python(code: str) -> str:
+def run_python(code):
     if not code or not code.strip():
         return "[run_python ERROR] empty code"
     buf = io.StringIO()
@@ -252,7 +183,7 @@ Simple facts (planets, chemistry, math, dates) may be answered directly.
 ════ RETRY POLICY ════
 1. fetch_url error → try DIFFERENT URL (especially Wikipedia).
 2. run_python error → FIX code and retry.
-3. Budget: 10 tool calls.
+3. Budget: 8 tool calls.
 4. Only return {"error"} after 3 different sources fail.
 
 ════ RELIABLE URLs ════
@@ -268,23 +199,19 @@ Simple facts (planets, chemistry, math, dates) may be answered directly.
 Persistence beats first-try correctness."""
 
 
-def agent_answer(question: str, run_id: str) -> str:
+def agent_answer(question, run_id):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": question},
     ]
 
-    for step in range(10):
+    for step in range(8):
+        # Retry on 429 with backoff
         response = None
-        used_model = None
-
-        # Try each model until one responds
-        for attempt in range(len(FREE_MODELS) * 2):
-            idx, model = _pick_model()
-            used_model = model
+        for retry in range(4):
             try:
                 response = client.chat.completions.create(
-                    model=model,
+                    model=MODEL_NAME,
                     messages=messages,
                     tools=TOOLS_SCHEMA,
                     tool_choice="auto",
@@ -294,39 +221,24 @@ def agent_answer(question: str, run_id: str) -> str:
                 break
             except Exception as e:
                 err = str(e)
-                log_run({"run_id": run_id, "phase": f"llm_error_s{step}_a{attempt}",
-                         "model": model, "error": err[:400]})
-
-                err_lower = err.lower()
-
-                # Rate limit / quota / capacity → rotate
-                if any(x in err_lower for x in ["429", "rate", "quota", "exhausted",
-                                                  "unavailable", "capacity", "overloaded"]):
-                    _mark_model_ratelimited(idx, 60)
-                    time.sleep(1)
+                log_run({"run_id": run_id, "phase": f"llm_err_s{step}_r{retry}", "error": err[:400]})
+                if "429" in err or "rate" in err.lower():
+                    wait = 15 * (retry + 1)
+                    # Parse retry-after if present
+                    m = re.search(r'retry.*?(\d+\.?\d*)', err, re.I)
+                    if m:
+                        wait = min(int(float(m.group(1))) + 2, 40)
+                    log_run({"run_id": run_id, "phase": f"waiting_{wait}s"})
+                    time.sleep(wait)
                     continue
-
-                # Model doesn't support tool calling → skip for long time
-                if "tool" in err_lower and ("support" in err_lower or "not" in err_lower):
-                    _mark_model_ratelimited(idx, 3600)
-                    continue
-
-                # Model deprecated / not found → skip for long time
-                if "not found" in err_lower or "does not exist" in err_lower or "invalid model" in err_lower:
-                    _mark_model_ratelimited(idx, 3600)
-                    continue
-
-                # Other error — return
                 return json.dumps({"error": f"llm error: {err[:150]}"})
 
         if response is None:
-            return json.dumps({"error": "all free models rate limited"})
+            return json.dumps({"error": "rate limited after retries"})
 
         msg = response.choices[0].message
         log_run({
-            "run_id": run_id,
-            "phase": f"llm_step_{step}",
-            "model": used_model,
+            "run_id": run_id, "phase": f"llm_step_{step}",
             "content": (msg.content or "")[:1000],
             "tool_calls": [
                 {"name": tc.function.name, "args": tc.function.arguments[:300]}
@@ -340,8 +252,7 @@ def agent_answer(question: str, run_id: str) -> str:
                 "content": msg.content or "",
                 "tool_calls": [
                     {
-                        "id": tc.id,
-                        "type": "function",
+                        "id": tc.id, "type": "function",
                         "function": {"name": tc.function.name, "arguments": tc.function.arguments},
                     }
                     for tc in msg.tool_calls
@@ -361,16 +272,13 @@ def agent_answer(question: str, run_id: str) -> str:
                     result = run_python(args.get("code", ""))
                 else:
                     result = f"[unknown tool: {name}]"
-
                 log_run({
                     "run_id": run_id, "phase": f"tool_result_{step}",
                     "tool": name, "args": {k: str(v)[:200] for k, v in args.items()},
                     "output_preview": result[:800],
                 })
-
                 messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
+                    "role": "tool", "tool_call_id": tc.id,
                     "content": result[:4000],
                 })
             continue
@@ -378,14 +286,13 @@ def agent_answer(question: str, run_id: str) -> str:
         final = (msg.content or "").strip()
         final = re.sub(r"^```(?:json)?\s*", "", final)
         final = re.sub(r"\s*```$", "", final).strip()
-        log_run({"run_id": run_id, "phase": "final", "answer": final, "model": used_model})
+        log_run({"run_id": run_id, "phase": "final", "answer": final})
         return final if final else json.dumps({"error": "empty response"})
 
-    log_run({"run_id": run_id, "phase": "step_limit_hit"})
     return json.dumps({"error": "agent_step_limit"})
 
 
-def build_reply(final_answer_str: str) -> str:
+def build_reply(final_answer_str):
     try:
         parsed = json.loads(final_answer_str)
         if isinstance(parsed, dict) and "answer" in parsed and "log_url" in parsed:
@@ -396,7 +303,6 @@ def build_reply(final_answer_str: str) -> str:
     return json.dumps({"answer": answer_value, "log_url": LOG_URL}, ensure_ascii=False)
 
 
-# ─── Telegram ────────────────────────────────────────────────────
 def tg_get_updates(offset=None, timeout=30):
     params = {"timeout": timeout}
     if offset is not None:
@@ -412,7 +318,7 @@ def tg_send(chat_id, text):
                   timeout=20)
 
 
-def handle_message(msg: dict):
+def handle_message(msg):
     text = (msg.get("text") or msg.get("caption") or "").strip()
     chat_id = msg["chat"]["id"]
     user = msg.get("from", {}).get("username", "?")
@@ -447,7 +353,6 @@ def handle_message(msg: dict):
     tg_send(chat_id, reply)
 
 
-# ─── HTTP server ─────────────────────────────────────────────────
 app = Flask(__name__)
 
 
@@ -471,25 +376,9 @@ def status():
             lines = sum(1 for _ in f)
     except Exception:
         lines = 0
-    now = time.time()
-    model_states = []
-    for i, m in enumerate(FREE_MODELS):
-        cd = _model_cooldowns.get(i, 0)
-        model_states.append({
-            "idx": i + 1,
-            "model": m,
-            "active": i == _current_model_idx,
-            "cooldown_remaining_s": max(0, int(cd - now)),
-        })
     return jsonify({
-        "ok": True,
-        "provider": "openrouter",
-        "log_lines": lines,
-        "log_url": LOG_URL,
-        "current_model": FREE_MODELS[_current_model_idx],
-        "total_models": len(FREE_MODELS),
-        "models": model_states,
-        "cache_size": len(_url_cache),
+        "ok": True, "provider": "groq", "model": MODEL_NAME,
+        "log_lines": lines, "log_url": LOG_URL, "cache_size": len(_url_cache),
     })
 
 
@@ -498,9 +387,7 @@ def run_http():
 
 
 def main():
-    print(f"[boot] Bot starting. Provider=OpenRouter  Models={len(FREE_MODELS)}")
-    log_run({"phase": "boot", "provider": "openrouter",
-             "models": FREE_MODELS, "log_url": LOG_URL})
+    log_run({"phase": "boot", "provider": "groq", "model": MODEL_NAME, "log_url": LOG_URL})
     Thread(target=run_http, daemon=True).start()
     time.sleep(1)
 
