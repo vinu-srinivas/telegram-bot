@@ -36,7 +36,6 @@ FREE_MODELS = [
     "deepseek/deepseek-chat-v3.1:free",                     # Strong reasoning + tools
     "qwen/qwen3-235b-a22b:free",                            # Large + tools
     "mistralai/mistral-small-3.2-24b-instruct:free",        # Fast + tools
-    "meta-llama/llama-3.1-405b-instruct:free",              # Huge model
     "nvidia/llama-3.1-nemotron-70b-instruct:free",          # Solid backup
     "google/gemma-3-27b-it:free",                           # Google model
     "qwen/qwen3-coder:free",                                # Coding specialist
